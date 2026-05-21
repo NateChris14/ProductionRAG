@@ -15,6 +15,7 @@ import structlog
 import asyncio
 
 from pymilvus import MilvusClient, DataType
+from pinecone import Pinecone
 
 log = structlog.get_logger()
 _settings = get_settings()
@@ -154,6 +155,83 @@ class MilvusVectorStore(BaseVectorStore):
             collection_name=COLLECTION_NAME,
             filter=expr,
         )
+
+class PineconeVectorStore(BaseVectorStore):
+    """
+    Pinecone with namespace-per-tenant isolation and metadata filtering.
+    """
+
+    def __init__(self) -> None:
+
+        pc = Pinecone(api_key=_settings.pinecone_api_key)
+        self._index = pc.Index(COLLECTION_NAME)
+
+    async def upsert(self, chunks: list[Chunk]) -> None:
+
+        vectors = [
+            {
+                "id": c.id,
+                "values": c.embedding,
+                "metadata": {
+                    "text": c.text[:1000], #Pinecone metadata limit
+                    "tenant_id": c.metadata.tenant_id,
+                    "document_id": c.metadata.document_id,
+                    "chunk_index": c.metadata.chunk_index,
+                    "token_index": c.metadata.token_count,
+                    "acl_tags": ",".join(c.metadata.acl_tags)
+                },
+            }
+            for c in chunks if c.embedding
+        ]
+
+        namespace = chunks[0].metadata.tenant_id if chunks else "default"
+        await asyncio.to_thread(
+            self._index.upsert,
+            vectors=vectors,
+            namespace=namespace,
+        )
+
+    async def search(self, vector: list[float], top_k: int, tenant_id: str, filters: dict[str, Any],) -> list[RetrievedChunk]:
+
+        pf: dict[str, Any] = {}
+        if "source_type" in filters:
+            pf["source_type"] = {"$eq": filters["source_type"]}
+
+        raw = await asyncio.to_thread(
+            self._index.query,
+            vector=vector,
+            top_k=top_k,
+            namespace=tenant_id,
+            filter=pf if pf else None,
+            include_metadata=True,
+        )
+
+        return [
+            RetrievedChunk(
+                id=m.id,
+                text=m.metadata.get("text", ""),
+                score=float(m.score),
+                metadata=dict(m.metadata),
+            )
+            for m in raw.matches
+        ]
+
+    async def delete_by_document(self, document_id: str, tenant_id: str) -> None:
+        await asyncio.to_thread(
+            self._index.delete,
+            filter={"document_id": {"$eq": document_id}},
+            namespace=tenant_id,
+        )
+
+def get_vector_store() -> BaseVectorStore:
+    if _settings.vector_backend == "pinecone":
+        return PineconeVectorStore()
+    return MilvusVectorStore()
+
+
+
+    
+
 
 
 
